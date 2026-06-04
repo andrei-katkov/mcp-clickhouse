@@ -1,3 +1,5 @@
+import asyncio
+import copy
 import logging
 import json
 from typing import Optional, List, Any, Dict
@@ -59,6 +61,7 @@ class Table:
 
 
 MCP_SERVER_NAME = "mcp-clickhouse"
+CLIENT_CONFIG_OVERRIDES_KEY = "clickhouse_client_config_overrides"
 
 # Configure logging
 logging.basicConfig(
@@ -449,8 +452,26 @@ def _validate_query_for_destructive_ops(query: str) -> None:
         )
 
 
-def execute_query(query: str):
-    client = create_clickhouse_client()
+def get_session_client_config_overrides() -> dict | None:
+    """Return request-scoped ClickHouse client config overrides, if any."""
+    try:
+        ctx = get_context()
+    except RuntimeError:
+        return None
+
+    session_config_overrides = ctx.get_state(CLIENT_CONFIG_OVERRIDES_KEY)
+    if session_config_overrides and not isinstance(session_config_overrides, dict):
+        logger.warning(
+            "%s must be a dict, got %s. Ignoring.",
+            CLIENT_CONFIG_OVERRIDES_KEY,
+            type(session_config_overrides).__name__,
+        )
+        return None
+    return copy.deepcopy(session_config_overrides) if session_config_overrides else None
+
+
+def execute_query(query: str, session_config_overrides: dict | None = None):
+    client = create_clickhouse_client(session_config_overrides)
     try:
         _validate_query_for_destructive_ops(query)
 
@@ -473,9 +494,10 @@ def run_query(query: str):
     """
     logger.info(f"Executing query: {query}")
     try:
-        future = QUERY_EXECUTOR.submit(execute_query, query)
+        session_config_overrides = get_session_client_config_overrides()
+        future = QUERY_EXECUTOR.submit(execute_query, query, session_config_overrides)
+        timeout_secs = get_mcp_config().query_timeout
         try:
-            timeout_secs = get_mcp_config().query_timeout
             result = future.result(timeout=timeout_secs)
             # Check if we received an error structure from execute_query
             if isinstance(result, dict) and "error" in result:
@@ -498,18 +520,39 @@ def run_query(query: str):
         raise RuntimeError(f"Unexpected error during query execution: {str(e)}")
 
 
-def create_clickhouse_client():
+async def run_query_async(query: str) -> str:
+    """Async MCP-facing wrapper for ClickHouse queries."""
+    logger.info(f"Executing query: {query}")
+    try:
+        session_config_overrides = get_session_client_config_overrides()
+        future = QUERY_EXECUTOR.submit(execute_query, query, session_config_overrides)
+        timeout_secs = get_mcp_config().query_timeout
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(future), timeout=timeout_secs
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Query timed out after {timeout_secs} seconds: {query}")
+            future.cancel()
+            raise ToolError(f"Query timed out after {timeout_secs} seconds")
+    except ToolError:
+        raise
+    except Exception as e:
+        logger.error("Unexpected error in run_query_async: %s", str(e))
+        raise RuntimeError(f"Unexpected error during query execution: {str(e)}")
+
+
+def create_clickhouse_client(session_config_overrides: dict | None = None):
     client_config = get_config().get_client_config()
 
-    try:
-        ctx = get_context()
-        session_config_overrides = ctx.get_state("clickhouse_client_config_overrides")
-        if session_config_overrides:
-            logger.info(f"Applying session-specific ClickHouse client config overrides {session_config_overrides}")
-            client_config.update(session_config_overrides)
-    except RuntimeError:
-        # If we're outside a request context, just proceed with the default config
-        pass
+    if session_config_overrides is None:
+        session_config_overrides = get_session_client_config_overrides()
+    if session_config_overrides:
+        logger.debug(
+            "Applying session-specific ClickHouse client config overrides: %s",
+            list(session_config_overrides.keys()),
+        )
+        client_config.update(session_config_overrides)
 
     logger.info(
         f"Creating ClickHouse client connection to {client_config['host']}:{client_config['port']} "
@@ -698,14 +741,17 @@ def _init_chdb_client():
 if os.getenv("CLICKHOUSE_ENABLED", "true").lower() == "true":
     mcp.add_tool(Tool.from_function(list_databases))
     mcp.add_tool(Tool.from_function(list_tables))
-    mcp.add_tool(Tool.from_function(
-        run_query,
-        description=(
-            "Execute SQL queries in ClickHouse. Queries run in read-only mode by default. "
-            "Set CLICKHOUSE_ALLOW_WRITE_ACCESS=true to allow DDL and DML operations. "
-            "Set CLICKHOUSE_ALLOW_DROP=true to additionally allow destructive operations (DROP, TRUNCATE)."
+    mcp.add_tool(
+        Tool.from_function(
+            run_query_async,
+            name="run_query",
+            description=(
+                "Execute SQL queries in ClickHouse. Queries run in read-only mode by default. "
+                "Set CLICKHOUSE_ALLOW_WRITE_ACCESS=true to allow DDL and DML operations. "
+                "Set CLICKHOUSE_ALLOW_DROP=true to additionally allow destructive operations (DROP, TRUNCATE)."
+            ),
         )
-    ))
+    )
     logger.info("ClickHouse tools registered")
 
 
