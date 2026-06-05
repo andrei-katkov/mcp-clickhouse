@@ -743,7 +743,7 @@ if os.getenv("CLICKHOUSE_ENABLED", "true").lower() == "true":
     mcp.add_tool(Tool.from_function(list_tables))
     mcp.add_tool(
         Tool.from_function(
-            run_query_async,
+            run_query,
             name="run_query",
             description=(
                 "Execute SQL queries in ClickHouse. Queries run in read-only mode by default. "
